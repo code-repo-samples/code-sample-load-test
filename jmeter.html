@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>JMeter Snippets</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header>
+    <a href="index.html">Home</a>
+    <a href="artillery.html">Artillery</a>
+    <a href="k6.html">k6</a>
+    <a href="excel.html">Excel</a>
+    <a href="jmeter.html">JMeter</a>
+</header>
+
+<div class="container">
+    <h1>JMeter</h1>
+
+    <section>
+        <h2>Basic HTTP Request</h2>
+        <pre><code>
+Thread Group
+  → HTTP Request
+      Server: example.com
+      Path: /
+        </code></pre>
+    </section>
+
+    <section>
+        <h2>CSV Data Set Config</h2>
+        <pre><code>
+Filename: users.csv
+Variable Names: username,password
+Recycle on EOF: True
+        </code></pre>
+    </section>
+
+</div>
+
+</body>
+</html>
