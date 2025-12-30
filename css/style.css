@@ -1,0 +1,46 @@
+/* 
+  Global styling for the code snippet repository website.
+  Simple, readable, and optimized for developers.
+*/
+
+body {
+    font-family: Arial, sans-serif;
+    background-color: #f7f7f7;
+    margin: 0;
+    padding: 0;
+}
+
+header {
+    background-color: #24292e;
+    padding: 15px;
+}
+
+header a {
+    color: #ffffff;
+    margin-right: 15px;
+    text-decoration: none;
+    font-weight: bold;
+}
+
+.container {
+    max-width: 900px;
+    margin: auto;
+    padding: 20px;
+    background: #ffffff;
+}
+
+h1, h2 {
+    color: #333333;
+}
+
+pre {
+    background-color: #272822;
+    color: #f8f8f2;
+    padding: 15px;
+    overflow-x: auto;
+    border-radius: 5px;
+}
+
+section {
+    margin-bottom: 30px;
+}
