@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Artillery Snippets</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header>
+    <a href="index.html">Home</a>
+    <a href="artillery.html">Artillery</a>
+    <a href="k6.html">k6</a>
+    <a href="excel.html">Excel</a>
+    <a href="jmeter.html">JMeter</a>
+</header>
+
+<div class="container">
+    <h1>Artillery</h1>
+
+    <section>
+        <h2>Basic Load Test</h2>
+        <pre><code>
+config:
+  target: "https://example.com"
+  phases:
+    - duration: 60
+      arrivalRate: 10
+
+scenarios:
+  - flow:
+      - get:
+          url: "/"
+        </code></pre>
+    </section>
+
+    <section>
+        <h2>CSV Data Parameterization</h2>
+        <pre><code>
+config:
+  payload:
+    path: "users.csv"
+    fields:
+      - username
+      - password
+        </code></pre>
+    </section>
+
+</div>
+
+</body>
+</html>
