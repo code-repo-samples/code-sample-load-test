@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Excel Automation Snippets</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<header>
+    <a href="index.html">Home</a>
+    <a href="artillery.html">Artillery</a>
+    <a href="k6.html">k6</a>
+    <a href="excel.html">Excel</a>
+    <a href="jmeter.html">JMeter</a>
+</header>
+
+<div class="container">
+    <h1>Excel</h1>
+
+    <section>
+        <h2>Read Excel (Python)</h2>
+        <pre><code>
+import pandas as pd
+
+df = pd.read_excel("data.xlsx")
+print(df.head())
+        </code></pre>
+    </section>
+
+    <section>
+        <h2>Write Excel (Python)</h2>
+        <pre><code>
+df.to_excel("output.xlsx", index=False)
+        </code></pre>
+    </section>
+
+</div>
+
+</body>
+</html>
