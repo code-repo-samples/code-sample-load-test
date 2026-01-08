@@ -1,0 +1,406 @@
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+// --- Global State & Pools ---
+const pools = {};
+let isDrained = false;
+
+// --- Exported Functions ---
+module.exports = {
+    generateProductData,
+    logAndSaveIds,
+    logProductId,
+    pullFromPool
+};
+
+/**
+ * PHASE 1: Generate unique product data
+ */
+function generateProductData(userContext, events, done) {
+    const uuid = crypto.randomUUID();
+    const shortId = uuid.substring(0, 5);
+
+    const names = ['James', 'Mary', 'Robert', 'Patricia', 'John'];
+    const cities = ['New York', 'Los Angeles', 'Chicago'];
+
+    // Set variables to be used in the YAML
+    userContext.vars.productId = `P-${shortId}`;
+    userContext.vars.fullName = names[Math.floor(Math.random() * names.length)];
+    userContext.vars.city = cities[Math.floor(Math.random() * cities.length)];
+    userContext.vars.zipCode = Math.floor(10000 + Math.random() * 90000).toString();
+    userContext.vars.price = Math.floor(Math.random() * 9000) + 1000;
+
+    return done();
+}
+
+/**
+ * PHASE 1: Log success to CSV or print failure details
+ */
+function logAndSaveIds(requestParams, response, userContext, ee, next) {
+    if (response.statusCode === 201) {
+        // Save for next test phase
+        fs.appendFileSync('created_products.csv', `${userContext.vars.productId}\n`);
+    } else {
+        console.error(`FAIL | CREATE | ${response.statusCode} | ${userContext.vars.productId} | ${response.body}`);
+    }
+    return next();
+}
+
+/**
+ * Legacy/Simple logging to .txt file
+ */
+function logProductId(requestParams, response, userContext, ee, next) {
+    if (response.statusCode === 201) {
+        const data = `${userContext.vars.productId}\n`;
+        fs.appendFileSync('created_products.txt', data, (err) => {
+            if (err) console.error('Error writing to file', err);
+        });
+    }
+    return next();
+}
+
+/**
+ * PHASE 2: Pull IDs from CSV pool with pointer management
+ */
+// function pullFromPool(userContext, events, done) {
+//     if (isDrained) {
+//         userContext.vars.skipMe = true;
+//         return done();
+//     }
+
+//     const fileName = userContext.vars.sourceFile || "created_products.csv";
+//     const targetVar = userContext.vars.targetVar || "productId";
+
+//     // Initialize pool if not already loaded
+//     if (!pools[fileName]) {
+//         const csvPath = path.join(__dirname, fileName);
+//         if (!fs.existsSync(csvPath)) return done(new Error(`CSV file not found: ${fileName}`));
+
+//         pools[fileName] = fs.readFileSync(csvPath, 'utf8')
+//             .replace(/^\uFEFF/, '')
+//             .split(/\r?\n/)
+//             .map(line => line.trim())
+//             .filter(line => line.length > 0);
+//     }
+
+//     const pointerFile = path.join(__dirname, `.${fileName}.pointer`);
+
+//     try {
+//         if (!fs.existsSync(pointerFile)) { fs.writeFileSync(pointerFile, '0'); }
+//         let currentIndex = parseInt(fs.readFileSync(pointerFile, 'utf8').trim(), 10) || 0;
+
+//         // Check if we hit the end of the data
+//         if (currentIndex >= pools[fileName].length) {
+//             console.log(`\n--- ⏹️ DATA POOL DRAINED ---`);
+//             isDrained = true;
+//             userContext.vars.skipMe = true;
+//             return done();
+//         }
+
+//         // Assign data and increment pointer
+//         userContext.vars[targetVar] = pools[fileName][currentIndex];
+//         userContext.vars.skipMe = false;
+//         fs.writeFileSync(pointerFile, (currentIndex + 1).toString());
+
+//     } catch (err) {
+//         return done(err);
+//     }
+//     return done();
+// }
+
+
+/**
+ * Generic Phase 2: Pulls row, splits by comma, and maps to variables
+ * defined in the YAML config.
+ */
+function pullFromPool(userContext, events, done) {
+  if (isDrained) {
+    userContext.vars.skipMe = true;
+    return done();
+  }
+
+  // Support both sourceFile or a default
+  const fileName = userContext.vars.sourceFile || "created_products.csv";
+
+  if (!pools[fileName]) {
+    const csvPath = path.join(__dirname, fileName);
+    if (!fs.existsSync(csvPath)) return done(new Error(`File not found: ${csvPath}`));
+    
+    let lines = fs.readFileSync(csvPath, 'utf8')
+                  .replace(/^\uFEFF/, '')
+                  .split(/\r?\n/)
+                  .map(line => line.trim())
+                  .filter(line => line.length > 0);
+
+    // --- CHECK FOR HEADER ---
+    // If the first line is exactly 'productID', remove it so we don't test it
+    if (lines[0].toLowerCase() === 'productid') {
+      lines.shift(); 
+    }
+    pools[fileName] = lines;
+  }
+
+  const pointerFile = path.join(__dirname, `.${fileName}.pointer`);
+  
+  try {
+    if (!fs.existsSync(pointerFile)) { fs.writeFileSync(pointerFile, '0'); }
+    let currentIndex = parseInt(fs.readFileSync(pointerFile, 'utf8').trim(), 10) || 0;
+
+    if (currentIndex >= pools[fileName].length) {
+        console.log(`--- ⏹️ DATA POOL DRAINED ---`);
+        isDrained = true;
+        userContext.vars.skipMe = true;
+        // process.kill(process.pid, 'SIGKILL');
+        // setTimeout(() => {
+                // process.kill(process.pid, 'SIGKILL');
+                // process.emit('SIGINT');
+            // }, 10);
+
+        return done(new Error("DATA_POOL_EMPTY"));
+        return done();
+    }
+
+    const rawRow = pools[fileName][currentIndex];
+    const columns = rawRow.split(',');
+
+    // --- MAPPING LOGIC ---
+    // We look for columnMap (array) OR targetVar (string)
+    const columnMap = userContext.vars.columnMap;
+    const targetVar = userContext.vars.targetVar || "productID";
+
+    if (Array.isArray(columnMap)) {
+      columnMap.forEach((varName, index) => {
+        userContext.vars[varName] = columns[index] ? columns[index].trim() : undefined;
+      });
+    } else {
+      // Fallback: If no array map, use the targetVar string
+      userContext.vars[targetVar] = columns[0].trim();
+    }
+
+    userContext.vars.skipMe = false;
+    fs.writeFileSync(pointerFile, (currentIndex + 1).toString());
+
+  } catch (err) {
+    return done(err);
+  }
+  return done();
+}
+
+
+------
+config:
+  target: "https://igz1l057yd.execute-api.us-east-2.amazonaws.com/Prod"
+  processor: "./processor.js"
+  
+  variables:
+    apiKey: "qMe1WKnBpv7aIV30u9U588F4XAzSh5Ex9HiZyDJH"
+    tokenUrl: "https://us-east-2dol8jtcrd.auth.us-east-2.amazoncognito.com/oauth2/token"
+    clientId: "op8fat6ad4uj8meoprtseqp33"
+    clientSecret: "a0d98itqa9ule1ihi41t2pm4nf6tb63bavd3cl3kdj9jqq73vv3"
+    sourceFile: "created_products.txt"  # The file to read
+    # targetVar: "productID"       # The variable name to use in {{ }}
+    columnMap: ["productID"]
+    recycleData: false  # Set to false to abort when IDs run out
+
+  plugins:
+    expect: {}
+    ensure:
+      maxErrorRate: 1
+
+  phases:
+    - duration: 100
+      arrivalRate: 6
+      name: "CRUD Operations"
+
+scenarios:
+  - name: "Manage Existing Products"
+    flow:
+      - post:
+          url: "{{ tokenUrl }}"
+          # Using 'form' tells Artillery to use application/x-www-form-urlencoded
+          form:
+            grant_type: "client_credentials"
+            client_id: "{{ clientId }}"
+            client_secret: "{{ clientSecret }}"
+          expect:
+            - statusCode: 201
+          capture:
+            - json: "$.access_token"
+              as: "accessToken"
+      
+      # - log: "Captured Token: {{ accessToken }}"
+
+      - function: "pullFromPool"
+      # Stop this VU if CSV is empty
+      - log: "Processing ID: {{ productID }}"
+        # ifTrue: "skipMe == false" 
+      
+      # # 1. GET Product
+      # - get:
+      #     url: "/products/{{ productId }}"
+      #     headers:
+      #       Authorization: "Bearer {{ accessToken }}"
+      #       x-api-key: "{{ apiKey }}"
+      #     ifTrue: "skipMe == false"
+
+      # # 2. UPDATE Product
+      # - put:
+      #     url: "/products/{{ productId }}"
+      #     headers:
+      #       Authorization: "Bearer {{ accessToken }}"
+      #       x-api-key: "{{ apiKey }}"
+      #     json:
+      #       name: "Updated Name"
+      #       price: 999
+      #     ifTrue: "skipMe == false"
+
+      # # 3. DELETE Product
+      # - delete:
+      #     url: "/products/{{ productId }}"
+      #     headers:
+      #       Authorization: "Bearer {{ accessToken }}"
+      #       x-api-key: "{{ apiKey }}"
+      #     ifTrue: "skipMe == false"
+
+
+
+==============
+
+Auth Generration JS
+-------------------------
+
+const https = require('https');
+
+// Global cache persists across all VUs in the same process
+const tokenCache = {};
+
+module.exports = {
+  getAuthToken: (requestParams, context, ee, next) => {
+    // 1. Extract variables safely
+    const vars = context.vars || {};
+    const clientId = vars.clientId;
+    const clientSecret = vars.clientSecret;
+
+    // Helper for safe logging
+    const getVuId = () => (context.uuid ? context.uuid.substring(0, 5) : '00000');
+
+    if (!clientId) {
+      console.error('[ERROR] clientId missing. Check CSV configuration.');
+      return next(new Error('Missing credentials'));
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const expirySeconds = 300; 
+    const renewBefore = 60;    
+
+    // --- CACHE CHECK ---
+    if (tokenCache[clientId]) {
+      const { token, generatedAt } = tokenCache[clientId];
+      const age = now - generatedAt;
+
+      if (age < (expirySeconds - renewBefore)) {
+        context.vars.accessToken = token;
+        
+        if (process.env.DEBUG === 'true') {
+          const ts = new Date().toLocaleTimeString();
+          console.log(`[${ts}] [VU:${getVuId()}] ♻️  REUSE: Token for ${clientId.substring(0, 8)} (Age: ${age}s)`);
+        }
+        return next();
+      }
+    }
+
+    // --- TOKEN GENERATION ---
+    if (process.env.DEBUG === 'true') {
+        const ts = new Date().toLocaleTimeString();
+        console.log(`[${ts}] [VU:${getVuId()}] 🆕 NEW: Fetching token for ${clientId.substring(0, 8)}`);
+    }
+
+    const postData = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`;
+
+    const options = {
+      hostname: 'us-east-2dol8jtcrd.auth.us-east-2.amazoncognito.com',
+      path: '/oauth2/token',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => body += chunk);
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          try {
+            const parsedBody = JSON.parse(body);
+            const token = parsedBody.access_token;
+            
+            tokenCache[clientId] = { token, generatedAt: now };
+            context.vars.accessToken = token;
+            next();
+          } catch (e) {
+            next(new Error('Failed to parse Cognito JSON response'));
+          }
+        } else {
+          console.error(`[AUTH ERROR] Status: ${res.statusCode} | Body: ${body}`);
+          next(new Error(`Cognito Auth Failed: ${res.statusCode}`));
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      console.error(`[HTTPS ERROR] ${err.message}`);
+      next(err);
+    });
+
+    req.write(postData);
+    req.end();
+  }
+};
+
+==============
+config:
+  target: "https://igz1l057yd.execute-api.us-east-2.amazonaws.com/Prod"
+  phases:
+    - duration: 600 # 10 minutes
+      arrivalRate: 2 # 2 requests every 10 seconds (matches your k6 TPS)
+      name: Constant Load
+  
+  # 1. Load your CSV (Artillery picks a row per user)
+  payload:
+    path: "./auth_creds.csv"
+    fields:
+      - "clientId"      # Must match the variable name in JS
+      - "clientSecret"  # Must match the variable name in JS
+    skipHeader: true
+    cast: false         # Ensure strings stay strings
+    order: sequence
+
+  # 2. Link the custom JS logic
+  processor: "./auth.js"
+
+  defaults:
+    headers:
+      x-api-key: "qMe1WKnBpv7aIV30u9U588F4XAzSh5Ex9HiZyDJH"
+      Content-Type: "application/json"
+
+scenarios:
+  - name: "CREATE Product with Unique Tokens"
+    
+    # beforeRequest: "getAuthToken" # Calls JS function before every request
+    flow:
+      - log: "{{clientId}}"
+      - post:
+          url: "/products"
+          beforeRequest: "getAuthToken"
+          headers:
+            Authorization: "Bearer {{ accessToken }}"
+          json:
+            productId: "{{ $uuid }}" # Built-in Artillery variable
+            name: "Artillery Product {{ $randomString() }}"
+            category: "Electronics"
+            price: "{{ $randomNumber(500, 1000) }}"
+          expect:
+            - statusCode: [200, 201]
