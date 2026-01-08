@@ -1,0 +1,477 @@
+import http from 'k6/http';
+import { check, group } from 'k6';
+import { SharedArray } from 'k6/data';
+import exec from 'k6/execution';
+import { PerformanceFramework } from './k6-framework-processor.js';
+import { Trend } from 'k6/metrics';
+import { htmlReport } from "https://raw.githubusercontent.com/benc-uk/k6-reporter/2.4.0/dist/bundle.js";
+import { textSummary } from "https://jslib.k6.io/k6-summary/0.1.0/index.js";
+
+// ----------------------
+// 1. Test options
+// ----------------------
+export const options = {
+    scenarios: {
+        constant_request_rate: {
+            executor: 'constant-arrival-rate',
+            rate: 2,             // 1 iteration per second
+            timeUnit: '1s',      // 1 TPS
+            duration: '30s',    // 5 minutes
+            preAllocatedVUs: 1,
+            maxVUs: 5,
+        },
+    },
+};
+
+// ----------------------
+// 2. Configuration
+// ----------------------
+const CONFIG = {
+    baseUrl: 'https://igz1l057yd.execute-api.us-east-2.amazonaws.com/Prod',
+    tokenUrl: 'https://us-east-2dol8jtcrd.auth.us-east-2.amazoncognito.com/oauth2/token',
+    clientId: 'op8fat6ad4uj8meoprtseqp33',
+    clientSecret: 'a0d98itqa9ule1ihi41t2pm4nf6tb63bavd3cl3kdj9jqq73vv3',
+    apiKey: 'qMe1WKnBpv7aIV30u9U588F4XAzSh5Ex9HiZyDJH',
+    expirySeconds: 300,  // token expiry
+    renewBefore: 60,     // renew 60s before expiry
+};
+
+// ----------------------
+// 3. Initialize framework
+// ----------------------
+const pf = new PerformanceFramework();
+
+// ----------------------
+// 4. Setup function (runs once, before VUs start)
+// ----------------------
+// export function setup() {
+//     console.log('Setup: generating initial token...');
+    
+//     // Create a new instance of the framework
+//     const pfSetup = new PerformanceFramework();
+
+//     // Pass "verbose=false" or add a parameter to skip VU logging
+//     const token = pfSetup.getToken(CONFIG, false);
+
+//     console.log('[SETUP] Token generated:', token);
+
+//     return { token };
+// }
+
+
+// ----------------------
+// 5. Main default function (per iteration)
+// ----------------------
+export default function (data) {
+    // const token = data.token; // reuse token from setup
+    const token = pf.getToken(CONFIG); // will reuse or regenerate as needed
+
+    const synthetic_data = pf.generateSynthetic();
+
+    group('CREATE Product', () => {
+        // Generate price first so it can be used in payload and CSV
+        const price = Math.floor(500 + Math.random() * 500);
+
+        // Construct payload object
+        const payloadObj = {
+            productId: synthetic_data.uuid,
+            name: synthetic_data.fullName,
+            category: 'Electronics',
+            price: price,
+        };
+
+        // Stringify for HTTP request
+        const payload = JSON.stringify(payloadObj);
+
+        const headers = {
+            Authorization: `Bearer ${token}`, // must include 'Bearer'
+            'x-api-key': CONFIG.apiKey,
+            'Content-Type': 'application/json',
+        };
+
+        const res = http.post(`${CONFIG.baseUrl}/products`, payload, { headers });
+
+        // Check that the request succeeded
+        check(res, { 'CREATE success': r => r.status === 200 || r.status === 201 });
+
+        // Log to CSV if valid
+        if (pf.isValid(res)) {
+            pf.writeCsv(
+                ['productId', 'status', 'category', 'price', 'timestamp'],
+                [synthetic_data.uuid, res.status, 'Electronics', price, new Date().toISOString()]
+            );
+        }
+    });
+
+    // Pause 0.5–1.5s to mimic real user think time
+    pf.pause(0.5, 1.5);
+}
+
+
+
+// 4. Summary Handler: Ensures you get a local HTML file AND terminal output
+export function handleSummary(data) {
+  return {
+    "summary.html": htmlReport(data),
+    stdout: textSummary(data, { indent: " ", enableColors: true }),
+  };
+}
+
+
+--------
+import { SharedArray } from 'k6/data';
+import exec from 'k6/execution';
+import { sleep } from 'k6';
+import http from 'k6/http';
+import Papa from './papaparse.js';
+
+/**
+ * PerformanceFramework v2.4 - VU-safe & reusable
+ */
+export class PerformanceFramework {
+    constructor() {
+        this.dataRegistry = {};
+        this._csvHeaderWritten = false;
+        this._token = null;
+        this._tokenGeneratedAt = 0;
+    }
+
+    // --- 1. DATA MANAGEMENT ---
+    /**
+     * Load CSV data files into SharedArray for VU-safe reuse.
+     * @param {Object} files - { key: filepath } mapping
+     */
+    loadDataFiles(files) {
+        for (const [key, path] of Object.entries(files)) {
+            this.dataRegistry[key] = new SharedArray(key, () => {
+                const data = open(path);
+                return Papa.parse(data, { header: true }).data;
+            });
+        }
+    }
+
+    /**
+     * Get data from a loaded CSV file.
+     * Modes:
+     *   - sequential
+     *   - random
+     *   - unique (non-recycled)
+     * @param {string} key 
+     * @param {string} mode 
+     * @param {boolean} loop - if true, wrap-around for unique
+     */
+    getCSVData(key, mode = 'sequential', loop = true) {
+        const data = this.dataRegistry[key];
+        if (!data) throw new Error(`Data key "${key}" not found.`);
+
+        const total = data.length;
+        const idx = exec.scenario?.iterationInTest || 0; // safe if outside VU
+
+        if (mode === 'random') return data[Math.floor(Math.random() * total)];
+
+        if (mode === 'unique') {
+            if (idx >= total) {
+                if (loop) return data[idx % total];
+                else exec.test.abort(`[STOP] ${key} data exhausted at index: ${idx}`);
+            }
+            return data[idx];
+        }
+
+        return data[idx % total];
+    }
+
+    // --- 2. SYNTHETIC DATA GENERATOR ---
+    generateSynthetic() {
+        const firstNames = ['James','Mary','Robert','Patricia','John','Jennifer','Michael','Linda','William','Elizabeth'];
+        const lastNames = ['Smith','Johnson','Williams','Brown','Jones','Garcia','Miller','Davis','Rodriguez'];
+        const cities = ['New York','Los Angeles','Chicago','Houston','Phoenix'];
+        const streets = ['Maple Ave','Oak St','Washington Blvd','Lakeview Dr'];
+        const countries = ['United States','Canada','United Kingdom','Australia'];
+
+        const vuId = exec.vu?.idInTest || 0;
+        const iter = exec.scenario?.iterationInTest || 0;
+        const randomSuffix = Math.random().toString(36).substring(2, 5).toUpperCase();
+        const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+        const fn = pick(firstNames);
+        const ln = pick(lastNames);
+        const ct = pick(cities);
+        const st = pick(streets);
+        const co = pick(countries);
+
+        const uniqueID = `${vuId}${iter}${randomSuffix}`;
+
+        return {
+            fullName:  `${fn} ${ln}`,
+            firstName: fn,
+            lastName:  ln,
+            email:     `perf${fn.toLowerCase()}.${ln.toLowerCase()}.${uniqueID}@example.com`,
+            street:    `${Math.floor(Math.random() * 9999) + 1} ${st}`,
+            city:      ct,
+            country:   co,
+            zipCode:   `${Math.floor(10000 + Math.random() * 89999)}`,
+            phone:     `555${Math.floor(1000000 + Math.random() * 8999999)}`,
+            uuid:      'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+                const r = Math.random() * 16 | 0;
+                const v = c === 'x' ? r : (r & 0x3 | 0x8);
+                return v.toString(16);
+            }),
+            nonce:     `N-${uniqueID}-${Date.now()}`
+        };
+    }
+
+    // --- 3. LOGGING & PAUSE ---
+    /**
+     * VU-safe log function: prints [VU|Iter] when in VU, else [SETUP]
+     * @param {string} message 
+     */
+    log(message) {
+        // Only use exec.vu.idInTest and exec.scenario.iterationInTest if they exist
+        if (exec.vu && exec.scenario) {
+            console.log(`[VU:${exec.vu.idInTest}|Iter:${exec.scenario.iterationInTest}] ${message}`);
+        } else {
+            console.log(`[SETUP/TEARDOWN] ${message}`);
+        }
+    }
+
+
+    /**
+     * Simple dual-stream CSV/file log
+     */
+    write(...vars) { console.error(vars.join(' | ')); }
+
+    /**
+     * Pause for random interval
+     */
+    pause(min = 1, max = 2) { sleep(Math.random() * (max - min) + min); }
+
+    // --- 4. CSV WRITER ---
+    writeCsv(headers, values) {
+        if (!values || values.length === 0) return;
+        if (!this._csvHeaderWritten) {
+            this.write(headers.join(','));
+            this._csvHeaderWritten = true;
+        }
+        const row = values.map(String).join(',');
+        this.write(row);
+    }
+
+    // --- 5. OAUTH TOKEN MANAGEMENT ---
+    /**
+     * Get or reuse OAuth token
+     * @param {object} config - { tokenUrl, clientId, clientSecret, expirySeconds, renewBefore }
+     */
+    getToken(config) {
+    const now = Date.now() / 1000; // seconds
+    const expiresIn = config.expirySeconds || 300;
+    const renewBefore = config.renewBefore || 60;
+
+    // If token exists and still valid, reuse
+    if (this._token && now - this._tokenGeneratedAt < (expiresIn - renewBefore)) {
+        console.log(`[TOKEN] Reusing existing token (expires in ${Math.round(expiresIn - renewBefore - (now - this._tokenGeneratedAt))}s)`);
+        return this._token;
+    }
+
+    console.log('[TOKEN] Generating new token...');
+
+    const payload = `grant_type=client_credentials&client_id=${encodeURIComponent(config.clientId)}&client_secret=${encodeURIComponent(config.clientSecret)}`;
+    const res = http.post(config.tokenUrl, payload, {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
+
+    console.log('[TOKEN] Status:', res.status);
+    console.log('[TOKEN] Response body:', res.body);
+
+    let token;
+    try {
+        token = JSON.parse(res.body).access_token;
+    } catch (err) {
+        console.error('[TOKEN] Failed to parse token:', err);
+        exec.test.abort('OAuth token parse failure');
+    }
+
+    if (!token) {
+        console.error('[TOKEN] Token not found in response');
+        exec.test.abort('OAuth token missing');
+    }
+
+    this._token = token;
+    this._tokenGeneratedAt = now;
+    console.log('[TOKEN] Successfully generated token');
+    return token;
+}
+
+//     getToken(config) {
+//     const now = Date.now() / 1000;
+//     const expiresIn = config.expirySeconds || 300; // default 5 min
+//     const renewBefore = config.renewBefore || 60;
+
+//     // reuse token if still valid
+//     if (this._token && now - this._tokenGeneratedAt < (expiresIn - renewBefore)) {
+//         console.log('[TOKEN] Reusing existing token');
+//         return this._token;
+//     }
+
+//     console.log('[TOKEN] Generating new token...');
+
+//     const payload =
+//         `grant_type=client_credentials` +
+//         `&client_id=${encodeURIComponent(config.clientId)}` +
+//         `&client_secret=${encodeURIComponent(config.clientSecret)}`;
+
+//     let res;
+//     try {
+//         res = http.post(config.tokenUrl, payload, {
+//             headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+//         });
+//     } catch (err) {
+//         console.error('[TOKEN] HTTP request failed:', err);
+//         exec.test.abort('OAuth token HTTP failure');
+//     }
+
+//     console.log('[TOKEN] Status:', res.status);
+//     console.log('[TOKEN] Response body:', res.body);
+
+//     let token;
+//     try {
+//         const body = JSON.parse(res.body);
+//         token = body.access_token;
+//     } catch (err) {
+//         console.error('[TOKEN] Failed to parse JSON:', err);
+//         exec.test.abort('OAuth token parse failure');
+//     }
+
+//     if (!token) {
+//         console.error('[TOKEN] Token not found in response');
+//         exec.test.abort('OAuth token missing');
+//     }
+
+//     this._token = token;
+//     this._tokenGeneratedAt = now;
+
+//     console.log('[TOKEN] Successfully generated token');
+//     return this._token;
+// }
+
+
+    // --- 6. RESPONSE HANDLING & CORRELATION ---
+    extract(res, pattern, strategy = 'random') {
+        try {
+            let results = [];
+            if (typeof pattern === 'string') {
+                const val = res.json(pattern);
+                results = Array.isArray(val) ? val : [val];
+            } else if (pattern instanceof RegExp) {
+                results = [...res.body.matchAll(pattern)].map(m => m[1]);
+            }
+            if (!results.length || results[0] === undefined) return null;
+            if (typeof strategy === 'number') return results[strategy];
+            return strategy === 'random' ? results[Math.floor(Math.random() * results.length)] : results[0];
+        } catch (e) { return null; }
+    }
+
+    isValid(res, correlation = true, strict = true) {
+        const hasError = res.status >= 400 || correlation === null;
+        if (hasError) {
+            this.log(`[ALERT] Status: ${res.status} | Correlation valid: ${correlation !== null}`);
+            return !strict;
+        }
+        return true;
+    }
+
+    getEnv(name, defaultValue) {
+        const value = __ENV[name];
+        return value !== undefined ? value : defaultValue;
+    }
+}
+
+
+--------------------
+
+
+import http from 'k6/http';
+import { check, group } from 'k6';
+import exec from 'k6/execution';
+import { PerformanceFramework } from './processor.js';
+
+export const options = {
+    scenarios: {
+        crud: {
+            executor: 'constant-arrival-rate',
+            rate: 5,
+            timeUnit: '1s',
+            duration: '120s',
+            preAllocatedVUs: 5,
+        },
+    },
+};
+
+const CONFIG = {
+    baseUrl: 'https://igz1l057yd.execute-api.us-east-2.amazonaws.com/Prod',
+    tokenUrl:
+        'https://us-east-2dol8jtcrd.auth.us-east-2.amazoncognito.com/oauth2/token',
+    clientId: 'op8fat6ad4uj8meoprtseqp33',
+    clientSecret:
+        'a0d98itqa9ule1ihi41t2pm4nf6tb63bavd3cl3kdj9jqq73vv3',
+    apiKey: 'qMe1WKnBpv7aIV30u9U588F4XAzSh5Ex9HiZyDJH',
+};
+
+const pf = new PerformanceFramework();
+pf.loadDataFiles({ products: './data/created_products.csv' });
+
+export function setup() {
+    const token = pf.getToken(CONFIG);
+    return { token };
+}
+
+export default function (data) {
+    const headers = {
+        Authorization: `Bearer ${data.token}`,
+        'x-api-key': CONFIG.apiKey,
+    };
+
+    const row = pf.getCSVData('products', 'unique', false);
+    const productId = row.productID;
+    pf.log(`Processing ProductID: ${productId}`);
+
+    // GET - 100%
+    group('GET Product', () => {
+        const res = http.get(`${CONFIG.baseUrl}/products/${productId}`, { headers });
+        check(res, {
+            'GET 200': (r) => r.status === 200,
+            'GET contains productId': (r) => r.body.includes(productId),
+        });
+        if (!pf.isValid(res, productId)) return;
+    });
+
+    const iter = exec.scenario.iterationInTest;
+
+    // UPDATE 50%
+    if (iter % 2 === 0) {
+        group('UPDATE Product', () => {
+            const res = http.put(
+                `${CONFIG.baseUrl}/products/${productId}`,
+                JSON.stringify({ price: Math.floor(500 + Math.random() * 500) }),
+                { headers }
+            );
+            check(res, { 'UPDATE OK': (r) => r.status === 200 });
+            pf.isValid(res);
+        });
+    }
+
+    // DELETE 30%
+    if (iter % 3 === 0) {
+        group('DELETE Product', () => {
+            const res = http.del(`${CONFIG.baseUrl}/products/${productId}`, null, { headers });
+            check(res, { 'DELETE OK': (r) => r.status === 200 || r.status === 204 });
+            pf.isValid(res);
+        });
+    }
+
+    pf.pause(0.5, 1.5);
+}
+
+
+
+
+
