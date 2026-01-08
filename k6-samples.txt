@@ -472,6 +472,172 @@ export default function (data) {
 }
 
 
+import http from 'k6/http';
+import { sleep, check, group } from 'k6';
+import { PerformanceFramework } from './framework.js';
 
+/**
+ * 1. WORKLOAD CONFIGURATION
+ * Defines the ramping pattern (VUs) and the Service Level Agreements (Thresholds).
+ */
+export const options = {
+    stages: [
+        { duration: '1m', target: 20 }, // Ramp-up to 20 users
+        { duration: '2m', target: 20 }, // Steady state (Load Test)
+        { duration: '1m', target: 0 },  // Ramp-down
+    ],
+    thresholds: {
+        'http_req_duration': ['p(99)<3000'], // 99% of requests must stay under 3s
+        'http_req_failed': ['rate<0.02'],    // Stop/Fail test if error rate > 2%
+    }
+};
+
+/**
+ * 2. FRAMEWORK INITIALIZATION
+ * Occurs once per VU at the start of the test.
+ */
+const pf = new PerformanceFramework();
+pf.loadDataFiles({
+    users: './users.csv',       // Expected: accountID, username, role
+    products: './products.csv'  // Expected: sku, priceID, xml_node
+});
+
+/**
+ * 3. THE VIRTUAL USER (VU) JOURNEY
+ * This function runs repeatedly for every VU for the duration of the test.
+ */
+export default function () {
+    
+    // --- A. AGNOSTIC DATA PREPARATION ---
+    // Pulls data from the first CSV (Unique mode ensures data distribution)
+    const user = pf.getCSVData('users', 'unique', true); 
+    
+    // Pulls data from the second CSV (Randomizes product choice)
+    const item = pf.getCSVData('products', 'random');  
+    
+    // Generates fresh synthetic data (No collisions in email/IDs)
+    const fake = pf.generateSynthetic();               
+    
+    // Fetches security keys from CLI or uses the fallback 'dev_token'
+    const appSecret = pf.getEnv('APP_SECRET', 'dev_token'); 
+    
+    // Local container for values extracted during the session
+    let session = {}; 
+
+    // --- B. PHYSICAL DATA AUDIT (stderr) ---
+    // We log the start of the VU journey to our physical file for traceability
+    pf.write("SESSION_START", user.accountID, fake.uuid);
+
+    /**
+     * TRANSACTION 1: GET CALL (Query Strings & Correlation)
+     * Objective: Perform a handshake and extract a session ID.
+     */
+    group('01_Auth_Handshake', function () {
+        // Construct URL with Query Parameters from CSV and Faker
+        const url = `https://httpbin.test.k6.io/get?user=${user.username}&nonce=${fake.nonce}`;
+        
+        // Pass the Environment Variable into the Header
+        const params = { headers: { 'X-Api-Key': appSecret } };
+
+        const res = http.get(url);
+        
+        // CORRELATION: Store the handshake ID for Step 2
+        session.handshakeId = pf.extract(res, 'args.nonce'); 
+
+        // CIRCUIT BREAKER: Check if status is 200 AND handshakeId was found
+        if (!pf.isValid(res, session.handshakeId, true)) {
+            // Log exactly where the failure happened to the physical file
+            pf.write("FAIL_STEP_1", res.status, `Reason: HandshakeMissing`, user.accountID);
+            return; // EXIT ITERATION: Do not proceed to Step 2
+        }
+    });
+
+    // GUARD RAIL: If Step 1 failed, stop this iteration completely
+    if (!session.handshakeId) return; 
+
+    // THINK TIME: Simulates the user reading the screen
+    pf.pause(1, 2); 
+
+    /**
+     * TRANSACTION 2: POST JSON (Dependency Injection)
+     * Objective: Create an order using the handshake ID from Transaction 1.
+     */
+    group('02_Create_Order_JSON', function () {
+        const payload = JSON.stringify({
+            account: user.accountID,      // From Users CSV
+            sku: item.sku,                // From Products CSV
+            session: session.handshakeId, // From Step 1 Correlation
+            email: fake.email             // From Faker
+        });
+
+        const res = http.post('https://httpbin.test.k6.io/post', payload, {
+            headers: { 'Content-Type': 'application/json' }
+        });
+
+        // CORRELATION: Extract Order ID via Regex from the raw response body
+        session.orderRef = pf.extract(res, /"uuid":\s*"([^"]+)"/);
+
+        if (!pf.isValid(res, session.orderRef, true)) {
+            pf.write("FAIL_STEP_2", res.status, user.accountID);
+            return; // EXIT ITERATION
+        }
+    });
+
+    if (!session.orderRef) return;
+
+    /**
+     * TRANSACTION 3: POST XML (Legacy Protocol Handling)
+     * Objective: Send fulfillment request using XML template literals.
+     */
+    group('03_Legacy_Fulfillment_XML', function () {
+        // Injecting correlated session IDs and Faker data into XML tags
+        const xmlBody = `
+        <FulfillmentRequest>
+            <Order>${session.orderRef}</Order>
+            <Location>${fake.address}</Location>
+            <Priority>High</Priority>
+        </FulfillmentRequest>`;
+
+        const res = http.post('https://httpbin.test.k6.io/post', xmlBody, {
+            headers: { 'Content-Type': 'application/xml' }
+        });
+
+        // Simple validation check
+        check(res, { 'XML Accepted': (r) => r.status === 200 });
+    });
+
+    /**
+     * TRANSACTION 4: POST FORM-DATA (Feedback)
+     * Objective: Submit a final form using standard URL Encoding.
+     */
+    group('04_Customer_Feedback_FORM', function () {
+        // Passing a plain JS object; k6 handles the form-encoding
+        const formData = {
+            order_id: session.orderRef,
+            rating: "5",
+            comment: `Automation Test for ${fake.fullName}`,
+            contact: fake.phone
+        };
+
+        const res = http.post('https://httpbin.test.k6.io/post', formData);
+
+        // Final logging of a completed successful journey
+        if (check(res, { 'Form OK': (r) => r.status === 200 })) {
+            pf.write("SUCCESS_COMPLETE", user.accountID, session.orderRef);
+        }
+    });
+
+    // FINAL THINK TIME: Simulates session ending
+    pf.pause(2, 5); 
+}
+
+/**
+ * 4. CUSTOM SUMMARY & REPORTING
+ * Executes at the very end of the test to generate the visual report.
+ */
+export function handleSummary(data) {
+    // Calls the static HTML/Chart.js parser inside your framework
+    return PerformanceFramework.generateSummary(data, "Enterprise_Audit_Report.html");
+}
 
 
