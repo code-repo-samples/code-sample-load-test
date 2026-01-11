@@ -1,3 +1,223 @@
+config:
+  target: "https://jsonplaceholder.typicode.com"
+  phases:
+    - duration: 60
+      arrivalRate: 5
+      # rampTo: 2
+      name: Warm up
+
+  plugins:
+    metrics-by-endpoint:
+      useOnlyRequestNames: true
+    expect:
+      reportFailuresAsErrors: false
+      outputFormat: prettyError
+
+  processor: "./processor_simple.js"
+
+scenarios:
+  - name: "Correlate and Randomize Posts"
+    beforeScenario: scenarioStart
+    afterScenario: scenarioEnd
+    flow:
+      - function: "generateRandomData"
+      - log: "keywords : {{ keywords }}"
+      
+      # Step 1: Call the posts endpoint
+      - get:
+          name: "GET /posts"
+          url: "/posts"
+          afterResponse: "captureMetrics"
+          capture:
+            - json: "$"
+              as: "allPosts"
+
+      # Step 2: Call JS functions
+      - function: "pickRandomPost"
+      # - function: "generateRandomNumber"
+      - function: "getIterationNumber"
+      - log: "This is Virtual User number: {{ iterationNumber }}"
+      # Step 3: Conditional Request
+      - get:
+          ifTrue: "iterationNumber % 10 < 3" # Execute it 30% times
+          name: "GET selectedIndex"
+          url: "/posts/{{ selectedId }}"
+          afterResponse: 
+            - "captureMetrics" #use this for custom metrics constanly pushed into a file
+            - "logResponse"
+          expect:
+            - statusCode: 200
+        
+
+
+
+
+/**
+ * Processor that captures per-endpoint metrics compatible with
+ * Artillery's metrics-by-endpoint plugin.
+ *
+ * Data is written incrementally and survives cancellation.
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+/**
+ * Append-only metrics stream (JSON Lines).
+ * Safe for crashes and high TPS.
+ */
+const metricsStream = fs.createWriteStream(
+  path.join(__dirname, 'artillery-metrics.jsonl'),
+  { flags: 'a' }
+);
+
+/**
+ * Ensure metrics are flushed on shutdown.
+ */
+process.on('SIGINT', () => {
+  try {
+    metricsStream.end();
+  } finally {
+    process.exit();
+  }
+});
+
+process.on('SIGTERM', () => {
+  try {
+    metricsStream.end();
+  } finally {
+    process.exit();
+  }
+});
+
+module.exports = {
+  pickRandomPost,
+  generateRandomData,
+  logResponse,
+  captureMetrics,
+  scenarioStart,
+  scenarioEnd,
+  getIterationNumber
+};
+
+/**
+ * --- Scenario Lifecycle Tracking ---
+ * These two functions log start/end of a scenario (virtual user)
+ * to the metrics file. This allows your analyzer to compute:
+ *  - vusers.created
+ *  - vusers.completed
+ *  - vusers.failed
+ *  - vusers.created_by_name.<scenario>
+ */
+
+function scenarioStart(userContext, events, done) {
+  const scenarioName = userContext.scenario?.name || 'UNKNOWN_SCENARIO';
+
+  metricsStream.write(JSON.stringify({
+    ts: Date.now(),
+    type: 'vuser_start',
+    scenario: scenarioName
+  }) + '\n');
+
+  return done();
+}
+
+function scenarioEnd(userContext, events, done) {
+  const scenarioName = userContext.scenario?.name || 'UNKNOWN_SCENARIO';
+
+  metricsStream.write(JSON.stringify({
+    ts: Date.now(),
+    type: 'vuser_end',
+    scenario: scenarioName
+  }) + '\n');
+
+  return done();
+}
+
+/**
+ * Pick a random post from previously captured list.
+ */
+function pickRandomPost(userContext, events, done) {
+  const posts = userContext.vars.allPosts;
+  const randomPost = posts[Math.floor(Math.random() * posts.length)];
+
+  userContext.vars.selectedId = randomPost.id;
+  userContext.vars.selectedTitle = randomPost.title;
+
+  return done();
+}
+
+
+//weightage logic
+
+let globalCounter = 0;
+
+function getIterationNumber(context, events, done) {
+  globalCounter++;
+  context.vars.iterationNumber = globalCounter;
+  return done();
+}
+
+
+/**
+ * Generate random keyword data.
+ */
+function generateRandomData(userContext, events, done) {
+  const words = ['laptop', 'phone', 'camera', 'headphones'];
+  userContext.vars.keywords = words[Math.floor(Math.random() * words.length)];
+  return done();
+}
+
+/**
+ * Lightweight response checker (NO console logging under load).
+ */
+function logResponse(requestParams, response, userContext, ee, next) {
+  // Example: count errors via Artillery events if needed
+  if (response.statusCode >= 400) {
+    console.error('error', response.statusCode);
+  }
+  return next();
+}
+
+/**
+ * Capture per-request metrics aligned with metrics-by-endpoint plugin.
+ *
+ * Uses request name (not URL) and correct latency field.
+ */
+function captureMetrics(requestParams, response, userContext, ee, next) {
+  try {
+    const latency = response.timings?.phases?.total;
+
+    // Skip if timing is unavailable
+    if (typeof latency !== 'number') {
+      return next();
+    }
+
+    const record = {
+      ts: Date.now(),
+      name: requestParams.name || 'UNNAMED_REQUEST',
+      method: requestParams.method,
+      statusCode: response.statusCode,
+      latencyMs: latency
+    };
+
+    metricsStream.write(JSON.stringify(record) + '\n');
+  } catch (err) {
+    // Never block the test
+  }
+
+  return next();
+}
+
+
+worked fine
+
+
+==============
+
+
+
+
 /**
  * Processor that captures per-endpoint metrics compatible with
  * Artillery's metrics-by-endpoint plugin.
