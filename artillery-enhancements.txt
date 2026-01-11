@@ -1,0 +1,539 @@
+/**
+ * Processor that captures per-endpoint metrics compatible with
+ * Artillery's metrics-by-endpoint plugin.
+ *
+ * Data is written incrementally and survives cancellation.
+ */
+
+const fs = require('fs');
+const path = require('path');
+
+/**
+ * Append-only metrics stream (JSON Lines).
+ * Safe for crashes and high TPS.
+ */
+const metricsStream = fs.createWriteStream(
+  path.join(__dirname, 'artillery-metrics.jsonl'),
+  { flags: 'a' }
+);
+
+/**
+ * Ensure metrics are flushed on shutdown.
+ */
+process.on('SIGINT', () => {
+  try {
+    metricsStream.end();
+  } finally {
+    process.exit();
+  }
+});
+
+process.on('SIGTERM', () => {
+  try {
+    metricsStream.end();
+  } finally {
+    process.exit();
+  }
+});
+
+module.exports = {
+  pickRandomPost,
+  generateRandomData,
+  logResponse,
+  captureMetrics,
+  scenarioStart,
+  scenarioEnd
+};
+
+/**
+ * --- Scenario Lifecycle Tracking ---
+ * These two functions log start/end of a scenario (virtual user)
+ * to the metrics file. This allows your analyzer to compute:
+ *  - vusers.created
+ *  - vusers.completed
+ *  - vusers.failed
+ *  - vusers.created_by_name.<scenario>
+ */
+
+function scenarioStart(userContext, events, done) {
+  const scenarioName = userContext.scenario?.name || 'UNKNOWN_SCENARIO';
+
+  metricsStream.write(JSON.stringify({
+    ts: Date.now(),
+    type: 'vuser_start',
+    scenario: scenarioName
+  }) + '\n');
+
+  return done();
+}
+
+function scenarioEnd(userContext, events, done) {
+  const scenarioName = userContext.scenario?.name || 'UNKNOWN_SCENARIO';
+
+  metricsStream.write(JSON.stringify({
+    ts: Date.now(),
+    type: 'vuser_end',
+    scenario: scenarioName
+  }) + '\n');
+
+  return done();
+}
+
+/**
+ * Pick a random post from previously captured list.
+ */
+function pickRandomPost(userContext, events, done) {
+  const posts = userContext.vars.allPosts;
+  const randomPost = posts[Math.floor(Math.random() * posts.length)];
+
+  userContext.vars.selectedId = randomPost.id;
+  userContext.vars.selectedTitle = randomPost.title;
+
+  return done();
+}
+
+/**
+ * Generate random keyword data.
+ */
+function generateRandomData(userContext, events, done) {
+  const words = ['laptop', 'phone', 'camera', 'headphones'];
+  userContext.vars.keywords = words[Math.floor(Math.random() * words.length)];
+  return done();
+}
+
+/**
+ * Lightweight response checker (NO console logging under load).
+ */
+function logResponse(requestParams, response, userContext, ee, next) {
+  // Example: count errors via Artillery events if needed
+  if (response.statusCode >= 400) {
+    ee.emit('error', response.statusCode);
+  }
+  return next();
+}
+
+/**
+ * Capture per-request metrics aligned with metrics-by-endpoint plugin.
+ *
+ * Uses request name (not URL) and correct latency field.
+ */
+function captureMetrics(requestParams, response, userContext, ee, next) {
+  try {
+    const latency = response.timings?.phases?.total;
+
+    // Skip if timing is unavailable
+    if (typeof latency !== 'number') {
+      return next();
+    }
+
+    const record = {
+      ts: Date.now(),
+      name: requestParams.name || 'UNNAMED_REQUEST',
+      method: requestParams.method,
+      statusCode: response.statusCode,
+      latencyMs: latency
+    };
+
+    metricsStream.write(JSON.stringify(record) + '\n');
+  } catch (err) {
+    // Never block the test
+  }
+
+  return next();
+}
+
+
+
+
+======================================
+
+
+
+
+
+/**
+ * Artillery Analyzer with Phase Handling, Scenario TPS, and CSV Export
+ *
+ * Features:
+ * - Overall metrics: min, mean, p50, p90, p95, p99, max
+ * - Per-endpoint metrics
+ * - Scenario / vuser counters
+ * - Request TPS and Scenario TPS (overall and per phase)
+ * - Optional phase handling from YAML
+ * - Console + optional text output
+ * - Flattened CSV export (--csv <file>) with human-readable timestamps
+ *   and scenario + phase attached to each API request
+ */
+
+const fs = require('fs');
+const path = require('path');
+const yaml = require('js-yaml');
+
+function percentile(sorted, p) {
+  const idx = Math.ceil((p / 100) * sorted.length) - 1;
+  return sorted[Math.max(0, idx)];
+}
+
+function mean(arr) {
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+function createWriter(outputFile) {
+  let buffer = '';
+  return {
+    write(line = '') {
+      console.log(line);
+      buffer += line + '\n';
+    },
+    flush() {
+      if (outputFile) fs.writeFileSync(outputFile, buffer, 'utf8');
+    }
+  };
+}
+
+function buildPhaseBuckets(phases, testStart) {
+  const buckets = [];
+  let currentStart = testStart;
+  for (const phase of phases) {
+    const name = phase.name || `Phase ${buckets.length + 1}`;
+    const durationMs = (phase.duration || 0) * 1000;
+    buckets.push({
+      name,
+      start: currentStart,
+      end: currentStart + durationMs,
+      records: []
+    });
+    currentStart += durationMs;
+  }
+  return buckets;
+}
+
+function csvWriter(records, csvFile, phaseBuckets = [], showPhaseMetrics = false) {
+  const lines = [];
+  lines.push(['ts','humanTs','scenario','phase','name','method','statusCode','latencyMs'].join(','));
+
+  // Track active scenario per VU
+  let activeScenario = '';
+
+  for (const r of records) {
+    const humanTs = new Date(r.ts).toISOString();
+    let phaseName = '';
+
+    if (showPhaseMetrics) {
+      for (const p of phaseBuckets) {
+        if (r.ts >= p.start && r.ts <= p.end) {
+          phaseName = p.name;
+          break;
+        }
+      }
+    }
+
+    // Update active scenario on vuser_start/end
+    if (r.type === 'vuser_start' || r.type === 'vuser_end') {
+      activeScenario = r.scenario || '';
+    }
+
+    // Use scenario from record if present, else inherit active scenario for API calls
+    const scenarioForRow = r.scenario || (r.latencyMs != null ? activeScenario : '');
+
+    lines.push([
+      r.ts,
+      humanTs,
+      scenarioForRow,
+      phaseName,
+      r.name || '',
+      r.method || '',
+      r.statusCode || '',
+      typeof r.latencyMs === 'number' ? r.latencyMs : ''
+    ].map(v => `"${v}"`).join(','));
+  }
+
+//   fs.writeFileSync(path.resolve(csvFile), lines.join('\n'), 'utf8');
+//   console.log(`CSV file written: ${csvFile}`);
+  try {
+    fs.writeFileSync(path.resolve(csvFile), lines.join('\n'), 'utf8');
+    console.log(`CSV file written: ${csvFile}`);
+  } catch (err) {
+    if (err.code === 'EBUSY') {
+      console.error(`Cannot write CSV file because it is open in another program: ${csvFile}`);
+    } else {
+      console.error(`Error writing CSV file: ${err.message}`);
+    }
+  }
+}
+
+function main() {
+  const args = process.argv.slice(2);
+  const inputFile = args[0];
+  let outputFile = null;
+  let yamlFile = null;
+  let csvFile = null;
+
+  if (!inputFile) {
+    console.error('Usage: node analyze.js <metrics.jsonl> [output.txt] [--phases <yaml-file>] [--csv <csv-file>]');
+    process.exit(1);
+  }
+
+  // Parse optional arguments
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === '--phases' && args[i + 1]) {
+      yamlFile = args[i + 1];
+      i++;
+    } else if (args[i] === '--csv' && args[i + 1]) {
+      csvFile = args[i + 1];
+      i++;
+    } else if (!outputFile) {
+      outputFile = args[i];
+    }
+  }
+
+  const inputPath = path.resolve(inputFile);
+  const writer = createWriter(outputFile);
+
+  if (!fs.existsSync(inputPath)) {
+    console.error(`File not found: ${inputPath}`);
+    process.exit(1);
+  }
+
+  const records = fs.readFileSync(inputPath, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map(JSON.parse);
+
+  // --- Global counters ---
+  let vusersCreated = 0;
+  let vusersCompleted = 0;
+  const scenarioCounts = {};
+  let pass = 0;
+  let fail = 0;
+  const endpoints = {};
+  const allLatencies = [];
+  let startTs = Infinity;
+  let endTs = 0;
+
+  // --- Phase setup ---
+  let phaseBuckets = [];
+  let showPhaseMetrics = false;
+  if (yamlFile) {
+    try {
+      const yamlPath = path.resolve(yamlFile);
+      if (fs.existsSync(yamlPath)) {
+        const doc = yaml.load(fs.readFileSync(yamlPath, 'utf8'));
+        const phases = doc?.config?.phases;
+        if (Array.isArray(phases) && phases.length > 0) {
+          const testStart = Math.min(...records.map(r => r.ts || Infinity));
+          phaseBuckets = buildPhaseBuckets(phases, testStart);
+          showPhaseMetrics = true;
+        } else {
+          console.warn('YAML file does not contain valid phases array. Skipping phase metrics.');
+        }
+      } else {
+        console.warn(`YAML file not found: ${yamlFile}. Skipping phase metrics.`);
+      }
+    } catch (err) {
+      console.warn(`Error reading YAML file: ${err.message}. Skipping phase metrics.`);
+    }
+  }
+
+  // --- Process JSONL ---
+  let activeScenario = '';
+  for (const r of records) {
+    if (r.type === 'vuser_start') {
+      vusersCreated++;
+      scenarioCounts[r.scenario] ??= 0;
+      scenarioCounts[r.scenario]++;
+      activeScenario = r.scenario || '';
+      startTs = Math.min(startTs, r.ts);
+      continue;
+    }
+
+    if (r.type === 'vuser_end') {
+      vusersCompleted++;
+      activeScenario = r.scenario || '';
+      endTs = Math.max(endTs, r.ts);
+    }
+
+    if (typeof r.latencyMs === 'number') {
+      allLatencies.push(r.latencyMs);
+      r.statusCode < 400 ? pass++ : fail++;
+
+      const name = r.name || 'UNNAMED_REQUEST';
+      endpoints[name] ??= { latencies: [], pass: 0, fail: 0 };
+      endpoints[name].latencies.push(r.latencyMs);
+      r.statusCode < 400 ? endpoints[name].pass++ : endpoints[name].fail++;
+
+      startTs = Math.min(startTs, r.ts);
+      endTs = Math.max(endTs, r.ts);
+
+      // Assign scenario to API requests
+      r.scenario = activeScenario;
+    }
+
+    // Assign record to phase if phases exist
+    if (showPhaseMetrics) {
+      let assigned = false;
+      for (const p of phaseBuckets) {
+        if (r.ts >= p.start && r.ts <= p.end) {
+          p.records.push(r);
+          assigned = true;
+          break;
+        }
+      }
+      if (!assigned && phaseBuckets.length > 0) {
+        phaseBuckets[phaseBuckets.length - 1].records.push(r);
+      }
+    }
+  }
+
+  const durationMs = endTs - startTs;
+  const durationSec = durationMs / 1000;
+  const tps = allLatencies.length / durationSec;
+  const scenarioTPSOverall = vusersCompleted / durationSec;
+
+  // --- Overall summary ---
+  allLatencies.sort((a, b) => a - b);
+  writer.write('=== Run Summary ===');
+  writer.write(`Started   : ${new Date(startTs).toLocaleString()}`);
+  writer.write(`Completed : ${new Date(endTs).toLocaleString()}`);
+  writer.write(`Duration  : ${durationSec.toFixed(1)}s`);
+  writer.write(`Total Requests: ${allLatencies.length}`);
+  writer.write(`Request TPS (overall): ${tps.toFixed(2)}`);
+  writer.write(`Scenario TPS (overall): ${scenarioTPSOverall.toFixed(2)}`);
+  writer.write('');
+
+  // --- Counters ---
+  writer.write('=== Counters ===');
+  writer.write(`http.requests       ${allLatencies.length}`);
+  writer.write(`http.responses      ${allLatencies.length}`);
+  writer.write(`http.codes.200      ${pass}`);
+  writer.write(`vusers.created      ${vusersCreated}`);
+  writer.write(`vusers.completed    ${vusersCompleted}`);
+  writer.write(`vusers.failed       ${vusersCreated - vusersCompleted}`);
+  for (const [scenario, count] of Object.entries(scenarioCounts)) {
+    writer.write(`vusers.created_by_name.${scenario} ${count}`);
+  }
+  writer.write('');
+
+  // --- Overall latency ---
+  writer.write('=== Overall Latency ===');
+  writer.write(`total: ${allLatencies.length}`);
+  writer.write(`pass:  ${pass}`);
+  writer.write(`fail:  ${fail}`);
+  writer.write(`min:   ${Math.min(...allLatencies)} ms`);
+  writer.write(`mean:  ${mean(allLatencies).toFixed(2)} ms`);
+  writer.write(`p50:   ${percentile(allLatencies, 50)} ms`);
+  writer.write(`p90:   ${percentile(allLatencies, 90)} ms`);
+  writer.write(`p95:   ${percentile(allLatencies, 95)} ms`);
+  writer.write(`p99:   ${percentile(allLatencies, 99)} ms`);
+  writer.write(`max:   ${Math.max(...allLatencies)} ms`);
+  writer.write('');
+
+  // --- Per-endpoint metrics ---
+  writer.write('=== Per-Endpoint Metrics ===');
+  for (const [endpoint, stats] of Object.entries(endpoints)) {
+    const l = stats.latencies.sort((a, b) => a - b);
+    writer.write(`\n${endpoint}`);
+    writer.write(`  total: ${l.length}`);
+    writer.write(`  pass:  ${stats.pass}`);
+    writer.write(`  fail:  ${stats.fail}`);
+    writer.write(`  min:   ${Math.min(...l)} ms`);
+    writer.write(`  mean:  ${mean(l).toFixed(2)} ms`);
+    writer.write(`  p50:   ${percentile(l, 50)} ms`);
+    writer.write(`  p90:   ${percentile(l, 90)} ms`);
+    writer.write(`  p95:   ${percentile(l, 95)} ms`);
+    writer.write(`  p99:   ${percentile(l, 99)} ms`);
+    writer.write(`  max:   ${Math.max(...l)} ms`);
+  }
+
+  // --- Phase-wise metrics ---
+  if (showPhaseMetrics) {
+    writer.write('\n=== Phase-wise Metrics ===');
+    for (const phase of phaseBuckets) {
+      const latencies = phase.records
+        .filter(r => typeof r.latencyMs === 'number')
+        .map(r => r.latencyMs);
+
+      const scenariosCompleted = phase.records.filter(r => r.type === 'vuser_end').length;
+      const phaseDurationSec = (phase.end - phase.start) / 1000 || 0.001;
+      const tpsPhase = latencies.length / phaseDurationSec;
+      const scenarioTPSPhase = scenariosCompleted / phaseDurationSec;
+
+      if (!latencies.length && !scenariosCompleted) continue;
+
+      latencies.sort((a, b) => a - b);
+      writer.write(`\nPhase: ${phase.name}`);
+      writer.write(`  Duration: ${phaseDurationSec.toFixed(1)}s`);
+      writer.write(`  Total Requests: ${latencies.length}`);
+      writer.write(`  Request TPS: ${tpsPhase.toFixed(2)}`);
+      writer.write(`  Scenario TPS: ${scenarioTPSPhase.toFixed(2)}`);
+      writer.write(`  min: ${Math.min(...latencies)} ms`);
+      writer.write(`  mean: ${mean(latencies).toFixed(2)} ms`);
+      writer.write(`  p50: ${percentile(latencies, 50)} ms`);
+      writer.write(`  p90: ${percentile(latencies, 90)} ms`);
+      writer.write(`  p95: ${percentile(latencies, 95)} ms`);
+      writer.write(`  p99: ${percentile(latencies, 99)} ms`);
+      writer.write(`  max: ${Math.max(...latencies)} ms`);
+    }
+  }
+
+  // --- CSV export ---
+  if (csvFile) {
+    csvWriter(records, csvFile, phaseBuckets, showPhaseMetrics);
+  }
+
+  writer.flush();
+}
+
+main();
+
+
+
+=======================
+config:
+  target: "https://jsonplaceholder.typicode.com"
+  phases:
+    - duration: 10
+      arrivalRate: 1
+      rampTo: 2
+      name: Warm up
+    - duration: 20
+      arrivalRate: 2
+      name: Ramp up load
+
+  plugins:
+    metrics-by-endpoint:
+      # Group metrics by request name rather than URL:
+      useOnlyRequestNames: true
+
+  processor: "./processor_simple.js"
+
+scenarios:
+  - name: "Correlate and Randomize Posts"
+    beforeScenario: scenarioStart
+    afterScenario: scenarioEnd
+    flow:
+      - function: "generateRandomData" # Calls JS function
+      - log: "keywords : {{ keywords }}"
+      # Step 1: Call the posts endpoint
+      - get:
+          name: "GET /posts"
+          url: "/posts"
+          afterResponse: "captureMetrics"
+          capture:
+            - json: "$"        # Capture the entire JSON array
+              as: "allPosts"   # Store it in 'allPosts'
+
+      # Step 2: Call the JS function to pick a random ID
+      - function: "pickRandomPost"
+
+      # Step 3: Pass the random ID to the next call
+      - get:
+          name: "GET selectedIndex"
+          url: "/posts/{{ selectedId }}"
+          afterResponse: "captureMetrics"
+          expect:
+            - statusCode: 200
+
+
+
