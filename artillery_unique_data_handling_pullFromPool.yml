@@ -1,0 +1,23 @@
+config:
+  target: "https://api.example.com"
+  processor: "processors/processor.js"
+  # --- ADD THIS SECTION ---
+  variables:
+    resetPointer: true
+    sourceFile: "clean_ids.csv"  # The file to read
+    targetVar: "productId"       # The variable name to use in {{ }}
+    recycleData: false  # Set to false to abort when IDs run out
+  # -------------------------
+  phases:
+    - duration: 30
+      arrivalRate: 30
+scenarios:
+  - name: "Safe Unique Delete"
+    flow:
+      - function: "pullFromPool"
+      # This matches 'targetVar' above
+      - log: "Requesting: /products/{{ productId }}"
+      - afterResponse: 
+          - "captureMetrics"
+      # - delete:
+      #     url: "/products/{{ productId }}"

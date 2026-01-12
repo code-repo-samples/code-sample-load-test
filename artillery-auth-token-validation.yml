@@ -1,0 +1,72 @@
+config:
+  target: "https://igz1l057yd.execute-api.us-east-2.amazonaws.com/Prod"
+  phases:
+    - duration: 10 # 10 minutes
+      arrivalRate: 1 # 2 requests every 10 seconds (matches your k6 TPS)
+      name: Constant Load
+  
+
+  plugins:
+    metrics-by-endpoint:
+      useOnlyRequestNames: true
+    expect:
+      reportFailuresAsErrors: false
+      outputFormat: silent
+
+  # 1. Load your CSV (Artillery picks a row per user)
+  payload:
+    path: "./auth_creds.csv"
+    fields:
+      - "clientId"      # Must match the variable name in JS
+      - "clientSecret"  # Must match the variable name in JS
+    skipHeader: true
+    cast: false         # Ensure strings stay strings
+    order: sequence
+
+  # 2. Link the custom JS logic
+  processor: "processors/processor.js"
+
+  defaults:
+    headers:
+      x-api-key: "qMe1WKnBpv7aIV30u9U588F4XAzSh5Ex9HiZyDJH"
+      Content-Type: "application/json"
+
+scenarios:
+  - name: "CREATE Product with Unique Tokens"
+    
+    # beforeRequest: "getAuthToken" # Calls JS function before every request
+    flow:
+      # - log: "{{clientId}}"
+      - post:
+          url: "/products"
+          name: "CreateProduct"
+          beforeRequest: "getAuthToken"
+          headers:
+            Authorization: "Bearer {{ accessToken }}"
+          json:
+            productId: "{{ $uuid }}" # Built-in Artillery variable
+            name: "Artillery Product {{ $randomString() }}"
+            category: "Electronics"
+            price: "{{ $randomNumber(500, 1000) }}"
+          afterResponse: 
+            - "captureMetrics"
+          expect:
+            - statusCode: [200, 201]
+          capture:
+            - json: "$"
+              as: "response"
+          # log : "Response: {{response}}"
+      - get:
+          url: "https://igz1l057yd.execute-api.us-east-2.amazonaws.com/Prod/products?category=Electronics"
+          name: "GetProduct"
+          # beforeRequest: "getAuthToken"
+          headers:
+            Authorization: "{{ accessToken }}"
+            x-api-key: "qMe1WKnBpv7aIV30u9U588F4XAzSh5Ex9HiZyDJH"
+          afterResponse: 
+            - "captureMetrics"
+          capture:
+              - json: "$"
+                as: "response"
+          # log : "Response: {{response}}"
+        

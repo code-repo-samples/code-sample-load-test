@@ -1,0 +1,65 @@
+config:
+  target: "https://jsonplaceholder.typicode.com"
+  phases:
+    - duration: 30
+      arrivalRate: 1
+      name: Warm up
+
+  plugins:
+    metrics-by-endpoint:
+      useOnlyRequestNames: true
+    expect:
+      reportFailuresAsErrors: false
+      outputFormat: silent
+
+  processor: "processors/processor.js"
+
+scenarios:
+  - name: "Correlate Posts per Request"
+    beforeScenario: scenarioStart
+    afterScenario: scenarioEnd
+    flow:
+      # Step 1: Fetch all posts
+      - get:
+          name: "GET /posts"
+          url: "/posts"
+          afterResponse:
+            - "captureMetrics"
+            - "logResponse"
+          capture:
+            - json: "$"
+              as: "postsResponse"
+
+      # Step 2: Set correlation variables for this request
+      - set:
+          correlationArrayVar: "postsResponse"
+          correlationArrayPath: ""  # flat array
+          correlationConfig:
+            - target: "selectedId"
+              field: "id"
+              mode: "RANDOM"
+              indexVar: "firstIndex"
+            - target: "selectedTitle"
+              field: "title"
+              mode: "INDEX"
+              indexFrom: "firstIndex"
+
+      # Step 3: Call generic correlation processor
+      - function: "correlate"
+
+      # Step 4: Log correlated values
+      - log: "Selected Post: {{ selectedId }} - {{ selectedTitle }}"
+
+      # Step 5: Weighted iteration tracking
+      - function: "getIterationNumber"
+
+      # Step 6: Conditional request using correlated ID
+      - get:
+          ifTrue: "iterationNumber % 10 < 3"  # ~30% of iterations
+          name: "GET selected post"
+          url: "/posts/{{ selectedId }}"
+          afterResponse:
+            - "captureMetrics"
+            - "logResponse"
+          expect:
+            - statusCode: 200
